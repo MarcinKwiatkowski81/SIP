@@ -54,27 +54,82 @@ public:
         fp_ = fopen(path, "rb");
         if (!fp_) { fprintf(stderr, "[WAV] cannot open '%s'\n", path); return false; }
 
-        WavHdr hdr;
-        if (fread(&hdr, 1, sizeof hdr, fp_) < sizeof hdr) { close(); return false; }
-        if (memcmp(hdr.riff,"RIFF",4)||memcmp(hdr.wave,"WAVE",4)) {
-            fprintf(stderr,"[WAV] not a RIFF/WAVE file\n"); close(); return false;
+        // ── RIFF/WAVE identity ────────────────────────────────────────────────
+        char id[4]; uint32_t chunkSz;
+        if (fread(id,1,4,fp_)!=4 || memcmp(id,"RIFF",4)) {
+            fprintf(stderr,"[WAV] '%s': not a RIFF file\n",path); close(); return false;
         }
-        if (hdr.audioFmt != 1) {
-            fprintf(stderr,"[WAV] only PCM (fmt=1) supported, got %u\n",hdr.audioFmt);
-            close(); return false;
+        fseek(fp_,4,SEEK_CUR);   // skip RIFF chunk size
+        if (fread(id,1,4,fp_)!=4 || memcmp(id,"WAVE",4)) {
+            fprintf(stderr,"[WAV] '%s': not a WAVE file\n",path); close(); return false;
         }
-        if (hdr.bitsPerSample != 16) {
-            fprintf(stderr,"[WAV] only 16-bit supported, got %u\n",hdr.bitsPerSample);
-            close(); return false;
+
+        // ── Scan chunks until we have both "fmt " and "data" ─────────────────
+        // This handles:
+        //   • fmtSize > 16  (18-byte PCM/cbSize, 40-byte WAVE_FORMAT_EXTENSIBLE)
+        //   • extra chunks between fmt and data (fact, LIST, bext, cue  …)
+        bool     gotFmt  = false, gotData = false;
+        uint16_t audioFmt = 0, channels = 0, bitsPerSample = 0;
+        uint32_t sampleRate = 0, dataSize = 0;
+
+        while (!gotData) {
+            if (fread(id,     1, 4, fp_) != 4) break;
+            if (fread(&chunkSz,4, 1, fp_) != 1) break;
+
+            if (memcmp(id,"fmt ",4)==0) {
+                // Read the first 16 bytes (minimum PCM fmt payload).
+                // If fmtSize > 16 the remainder is skipped below.
+                uint8_t buf[16] = {};
+                size_t toRead = chunkSz < 16 ? chunkSz : 16;
+                if (fread(buf, 1, toRead, fp_) != toRead) {
+                    fprintf(stderr,"[WAV] '%s': truncated fmt chunk\n",path);
+                    close(); return false;
+                }
+                // Skip any extension bytes beyond the standard 16
+                if (chunkSz > toRead)
+                    fseek(fp_, (long)(chunkSz - toRead) + (chunkSz & 1), SEEK_CUR);
+                else if (chunkSz & 1)
+                    fseek(fp_, 1, SEEK_CUR);   // pad byte per RIFF spec
+
+                memcpy(&audioFmt,      buf+0,  2);
+                memcpy(&channels,      buf+2,  2);
+                memcpy(&sampleRate,    buf+4,  4);
+                // buf+8 = byteRate (4), buf+12 = blockAlign (2)
+                memcpy(&bitsPerSample, buf+14, 2);
+
+                if (audioFmt != 1) {
+                    fprintf(stderr,"[WAV] '%s': only PCM (fmt=1) supported, got %u\n",
+                            path, audioFmt);
+                    close(); return false;
+                }
+                if (bitsPerSample != 16) {
+                    fprintf(stderr,"[WAV] '%s': only 16-bit PCM supported, got %u\n",
+                            path, bitsPerSample);
+                    close(); return false;
+                }
+                gotFmt = true;
+
+            } else if (memcmp(id,"data",4)==0) {
+                dataSize = chunkSz;   // audio data starts at current file position
+                gotData  = true;
+                // Do NOT seek; fp_ is now positioned at the first audio byte.
+
+            } else {
+                // Unknown / unwanted chunk — skip it (+ RIFF pad byte if odd size)
+                fseek(fp_, (long)chunkSz + (chunkSz & 1), SEEK_CUR);
+            }
         }
-        srcRate_  = hdr.sampleRate;
-        channels_ = hdr.channels;
-        dataLeft_ = hdr.dataSize;
-        // Compute integer decimation ratio  (e.g. 48000/8000 = 6)
-        ratio_    = (srcRate_ + 7999) / 8000;   // ceiling → never skip target
+
+        if (!gotFmt)  { fprintf(stderr,"[WAV] '%s': no fmt  chunk found\n",path); close(); return false; }
+        if (!gotData) { fprintf(stderr,"[WAV] '%s': no data chunk found\n",path); close(); return false; }
+
+        srcRate_  = sampleRate;
+        channels_ = channels;
+        dataLeft_ = dataSize;
+        ratio_    = (srcRate_ + 7999) / 8000;   // ceiling decimation factor
         if (ratio_ < 1) ratio_ = 1;
         printf("[WAV] '%s'  %u Hz  %u ch  %u bytes  ratio→8kHz: %u\n",
-               path, srcRate_, channels_, hdr.dataSize, ratio_);
+               path, srcRate_, channels_, dataSize, ratio_);
         return true;
     }
 

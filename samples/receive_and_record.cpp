@@ -155,7 +155,8 @@ static void* playbackThread(void* arg) {
     printf("[PLAY][%zu] started  caller=%s\n", slot->idx, slot->callerUri.c_str());
 
     int16_t frame[WavReader::FRAME];
-    int64_t nextTx       = msNow();
+    int64_t callStart    = msNow();   // for max-duration enforcement
+    int64_t nextTx       = callStart;
     int     silFrames    = 0;
     const int SILENCE_FRAMES = 25;   // 25 × 20 ms = 500 ms tail silence
 
@@ -167,11 +168,15 @@ static void* playbackThread(void* arg) {
         }
         nextTx += 20;
 
-        if (!slot->rtp || !slot->rtp->isOpen()) continue;
+        // Snapshot rtp pointer once per frame: onBye() can set slot->rtp=nullptr
+        // on the SIP thread at any time, so we must not read it twice.
+        RtpSession* rtp = slot->rtp;
+        if (!rtp || !rtp->isOpen()) continue;
 
-        // Enforce max call duration
-        if (g_maxSecs > 0 && msNow() - nextTx > (int64_t)g_maxSecs * 1000) {
-            printf("[PLAY][%zu] max duration reached\n", slot->idx);
+        // Enforce max call duration (callStart is captured once, before the loop)
+        if (g_maxSecs > 0 && msNow() - callStart >= (int64_t)g_maxSecs * 1000) {
+            printf("[PLAY][%zu] max duration reached (%d s)\n",
+                   slot->idx, g_maxSecs);
             break;
         }
 
@@ -184,7 +189,7 @@ static void* playbackThread(void* arg) {
                 break;
             }
         }
-        slot->rtp->sendAudio(frame, WavReader::FRAME);
+        rtp->sendAudio(frame, WavReader::FRAME);
     }
 
     printf("[PLAY][%zu] thread done\n", slot->idx);
