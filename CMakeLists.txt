@@ -94,6 +94,17 @@ target_compile_options(call_and_record PRIVATE
     -Wall -Wextra -Wno-unused-parameter
 )
 
+# ── receive_and_record sample ───────────────────────────────────────────────
+add_executable(receive_and_record samples/receive_and_record.cpp)
+target_include_directories(receive_and_record PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/samples
+)
+target_link_libraries(receive_and_record PRIVATE sip_core)
+target_compile_options(receive_and_record PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
 # ── sample_pbx (registrar + B2BUA PBX) ───────────────────────────────────────
 add_executable(sample_pbx
     samples/pbx/main.cpp
@@ -119,7 +130,7 @@ target_compile_options(transcode_smoke PRIVATE
 )
 
 if(SIP_ASAN)
-    foreach(TGT sip_core sip_client sip_server call_and_record sample_pbx transcode_smoke)
+    foreach(TGT sip_core sip_client sip_server call_and_record receive_and_record sample_pbx transcode_smoke)
         target_compile_options(${TGT} PRIVATE -fsanitize=address,undefined)
         target_link_options(${TGT}    PRIVATE -fsanitize=address,undefined)
     endforeach()

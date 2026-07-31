@@ -190,11 +190,19 @@ void RtpSession::handlePacket(const uint8_t* buf, size_t len) {
     if(cbs.onRawRtp) cbs.onRawRtp(buf,len);
 
     // RFC 4733 telephone-event
+    // RFC 4733 §2.5: the sender MUST retransmit the end-bit packet three times
+    // (for redundancy) using the same RTP timestamp for all packets of one event.
+    // Guard with the event timestamp so only the first end-bit fires onDtmf.
     if(pt==cfg_.dtmfPT && payLen>=sizeof(DtmfPayload)) {
         const DtmfPayload* dp=(const DtmfPayload*)payload;
         if(dp->endBit() && cbs.onDtmf) {
-            uint16_t dur=ntohs(dp->duration);
-            cbs.onDtmf(dp->event, (uint16_t)((uint32_t)dur*1000/8000));
+            uint32_t evTs = h->tsH();
+            if(!dtmfFired_ || evTs != dtmfLastTs_) {
+                dtmfLastTs_ = evTs;
+                dtmfFired_  = true;
+                uint16_t dur=ntohs(dp->duration);
+                cbs.onDtmf(dp->event, (uint16_t)((uint32_t)dur*1000/8000));
+            }
         }
         return;
     }

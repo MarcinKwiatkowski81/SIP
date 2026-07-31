@@ -47,6 +47,15 @@ static uint8_t dtmfDigit(char c) {
     return 0xFF;
 }
 
+/** Convert a DTMF digit value (0-15) back to its printable character. */
+static char dtmfChar(uint8_t digit) {
+    if (digit <= 9)  return (char)('0' + digit);
+    if (digit == 10) return '*';
+    if (digit == 11) return '#';
+    if (digit <= 15) return (char)('A' + digit - 12);  // A-D
+    return '?';
+}
+
 // Tick thread
 static void* tickThread(void* arg) {
     SipStack* stack=(SipStack*)arg;
@@ -91,6 +100,10 @@ int main(int argc, char** argv) {
     cbs.onBye=[](CallHandle h,int c){ printf("[BYE] call=%u code=%d\n",(unsigned)h,c); if(gCall==h) gCall=InvalidDialog; };
     cbs.onMessage=[](const char* from,const char* body,size_t len,const char*){ printf("[MSG] from %s: %.*s\n",from,(int)len,body); };
     cbs.onOptions=[](bool ok,int c){ printf("[OPTIONS] %s (%d)\n",ok?"OK":"FAIL",c); };
+    cbs.onDtmf=[](CallHandle h,uint8_t digit,uint16_t durMs){
+        printf("[DTMF] call=%u  digit=%c  duration=%ums\n",
+               (unsigned)h, dtmfChar(digit), (unsigned)durMs);
+    };
 
     SipStack stack;
     gStack=&stack;

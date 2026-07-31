@@ -163,11 +163,12 @@ void SipStack::onTxnRequest(TxnId id, const SipMessage& msg) {
     case Method::MESSAGE:  handleMessage (id,msg);                  break;
     case Method::OPTIONS:  handleOptions (id,msg);                  break;
     case Method::UPDATE:   handleUpdate  (id,msg);                  break;
+    case Method::INFO:     handleInfo    (id,msg);                  break;
     default:
         if (cbs_.onRequest) cbs_.onRequest(msg,id);
         else {
             SipMessage r=msg.makeResponse(405,"Method Not Allowed");
-            r.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+            r.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE",42);
             txn_.sendResponse(id,r);
         }
         break;
@@ -175,8 +176,12 @@ void SipStack::onTxnRequest(TxnId id, const SipMessage& msg) {
 }
 void SipStack::onTxnResponse(TxnId /*id*/, const SipMessage& msg) {
     if (msg.cseq.method == Method::REGISTER) { handleRegisterResp(msg); return; }
-    Dialog* d = dlg_.find(msg);
-    if (d) { handleInviteResp(d,msg); return; }
+    // Only route INVITE (and re-INVITE) responses through the dialog/SDP handler.
+    // BYE, CANCEL, and other in-dialog responses must not go through handleInviteResp.
+    if (msg.cseq.method == Method::INVITE) {
+        Dialog* d = dlg_.find(msg);
+        if (d) { handleInviteResp(d,msg); return; }
+    }
     if (msg.cseq.method==Method::OPTIONS && cbs_.onOptions)
         cbs_.onOptions(msg.is2xx(), msg.statusCode);
 }
@@ -200,7 +205,7 @@ bool SipStack::doRegister(uint32_t exp) {
                                 cfg_.localUser.c_str(),
                                 cfg_.localAddr.c_str(),cfg_.localPort);
     req.contact.uri.assign(contact,strlen(contact)); req.hasContact=true;
-    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE",42);
     req.userAgent.assign("sip_stack/1.0",13);
     if (regNeedAuth_) {
         char ab[512];
@@ -235,7 +240,7 @@ CallHandle SipStack::call(const char* target, Proto proto) {
                                 cfg_.localUser.c_str(),
                                 cfg_.localAddr.c_str(),cfg_.localPort);
     req.contact.uri.assign(contact,strlen(contact)); req.hasContact=true;
-    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE",42);
     req.userAgent.assign("sip_stack/1.0",13);
     // SDP offer
     uint16_t rtpPort = rtpNextPort();
@@ -264,37 +269,71 @@ CallHandle SipStack::call(const char* target, Proto proto) {
 // ── accept ────────────────────────────────────────────────────────────────────
 bool SipStack::accept(CallHandle h) {
     Dialog* d = dlg_.findById(h); if (!d||d->isUAC) return false;
-    SipMessage ok; ok.isRequest=false; ok.statusCode=200; ok.reason.assign("OK",2);
-    ok.from.uri=d->remoteUri; ok.from.tag=d->remoteTag;
-    ok.to.uri=d->localUri;   ok.to.tag=d->localTag;
-    ok.callId=d->callId; ok.cseq={d->remoteCSeq,Method::INVITE};
-    char contact[128]; snprintf(contact,sizeof contact,"sip:%s@%s:%u",
-                                cfg_.localUser.c_str(),
-                                cfg_.localAddr.c_str(),cfg_.localPort);
-    ok.contact.uri.assign(contact,strlen(contact)); ok.hasContact=true;
-    ok.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+    if (d->inviteTxn == InvalidTxn) return false;
+
+    // The original INVITE is still in the IST's reqBuf at this point.
+    // Parse it now, BEFORE sendResponse() terminates and frees the IST.
+    // We use makeResponse() so that Via headers are copied correctly
+    // (RFC 3261 §8.2.6) — every other UAS response does this; building
+    // the 200 OK manually without Via is why Asterisk was discarding it.
+    const Transaction* ist = txn_.findById(d->inviteTxn);
+    if (!ist) { fprintf(stderr,"[SIP] accept: IST not found for txn %u\n",d->inviteTxn); return false; }
+    if (!ist->reqLen) { fprintf(stderr,"[SIP] accept: IST reqBuf empty (reqLen=0)\n"); return false; }
+    auto invOpt = SipMessage::parse(ist->reqBuf, ist->reqLen);
+    if (!invOpt.ok()) { fprintf(stderr,"[SIP] accept: failed to re-parse INVITE from IST reqBuf\n"); return false; }
+    const SipMessage& inv = *invOpt;
+
+    SipMessage ok = inv.makeResponse(200, "OK");
+    // makeResponse copies: Via[], From, To (without tag), Call-ID, CSeq
+    ok.to.tag = d->localTag;   // add our local tag
+    char contact[128];
+    snprintf(contact, sizeof contact, "sip:%s@%s:%u",
+             cfg_.localUser.c_str(), cfg_.localAddr.c_str(), cfg_.localPort);
+    ok.contact.uri.assign(contact, strlen(contact)); ok.hasContact = true;
+    ok.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE", 42);
+
+    // Build proper SDP answer from the INVITE's offer
     uint16_t rtpPort = rtpNextPort();
-    size_t sdpLen = makeSdpAnswer(sdpBuf_,sizeof sdpBuf_,SdpSession(),rtpPort);
-    if (sdpLen&&d->remoteRtpPort) {
-        ok.body=sdpBuf_; ok.bodyLen=sdpLen;
-        ok.contentType.assign("application/sdp",15);
-        ok.contentLen=(uint32_t)sdpLen;
+    if (inv.body && inv.bodyLen && inv.contentType.eqi("application/sdp", 15)) {
+        auto sdpOffer = SdpSession::parse(inv.body, inv.bodyLen);
+        if (sdpOffer.ok()) {
+            size_t sdpLen = makeSdpAnswer(sdpBuf_, sizeof sdpBuf_, *sdpOffer, rtpPort);
+            if (sdpLen) {
+                ok.body = sdpBuf_; ok.bodyLen = sdpLen;
+                ok.contentType.assign("application/sdp", 15);
+                ok.contentLen = (uint32_t)sdpLen;
+            }
+        }
     }
-    if (d->inviteTxn!=InvalidTxn) txn_.sendResponse(d->inviteTxn,ok);
-    if (d->remoteRtpPort&&codecs_) {
+
+    // Send 200 OK — this terminates the IST (RFC 3261 §17.2.1) so we must
+    // not touch ist or inv after this point.
+    txn_.sendResponse(d->inviteTxn, ok);
+
+    // Open the RTP session so media is ready as soon as the ACK arrives.
+    // onConnected fires in handleAck() once the dialog is confirmed.
+    if (d->remoteRtpPort && codecs_) {
         RtpSession* rtp = rtpAlloc(d->id);
         if (rtp) {
             ICodec* codec = codecs_->findByPT(d->negotiatedPT);
             if (!codec) codec = codecs_->findByPT(0);
             if (codec) {
-                RtpSession::Config rc; rc.pt=codec->payloadType(); rc.ssrc=rnd32();
-                rtp->open(cfg_.localAddr.c_str(),rtpPort,
-                          d->remoteRtpHost.c_str(),d->remoteRtpPort,
-                          codec,rc,{nullptr,nullptr,nullptr});
+                RtpSession::Config rc; rc.pt = codec->payloadType(); rc.ssrc = rnd32();
+                DialogId did = d->id;
+                RtpCallbacks rtpCbs;
+                rtpCbs.onDtmf = [this, did](uint8_t digit, uint16_t durMs) {
+                    if (cbs_.onDtmf) cbs_.onDtmf(did, digit, durMs);
+                };
+                rtp->open(cfg_.localAddr.c_str(), rtpPort,
+                          d->remoteRtpHost.c_str(), d->remoteRtpPort,
+                          codec, rc, rtpCbs);
             }
         }
     }
-    dlg_.update(*d,ok,true);
+    // Do NOT call dlg_.update() with the outgoing 200 OK: DialogLayer::update()
+    // transitions to Confirmed on any 2xx, which would cause handleAck() to
+    // see wasConfirmed=true and skip onConnected.  Per RFC 3261 §13.3.1.4
+    // the UAS dialog is confirmed by *receiving* the ACK — done in handleAck().
     return true;
 }
 
@@ -312,6 +351,7 @@ bool SipStack::reject(CallHandle h, int code, const char* reason) {
 
 // ── bye ───────────────────────────────────────────────────────────────────────
 bool SipStack::bye(CallHandle h) {
+    Guard g(mu_);
     Dialog* d = dlg_.findById(h);
     if (!d||d->state!=DialogState::Confirmed) return false;
     SipMessage req; req.isRequest=true; req.method=Method::BYE;
@@ -414,7 +454,7 @@ bool SipStack::options(const char* target, Proto proto) {
     req.to.uri.assign(turi,strlen(turi));
     genCallId(req.callId); req.cseq={1,Method::OPTIONS}; req.maxForwards=70;
     fillVia(req, proto);
-    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE",42);
     auto uri = SipUri::parse(turi);
     const char* rh=uri.ok()?uri->host.c_str():cfg_.registrarHost.c_str();
     uint16_t    rp=uri.ok()?uri->effectivePort():cfg_.registrarPort;
@@ -460,12 +500,17 @@ void SipStack::handleAck(const SipMessage& msg) {
     Dialog* d=dlg_.find(msg); if (!d) return;
     bool wasConfirmed = (d->state == DialogState::Confirmed);
     dlg_.update(*d,msg,false);
-    // Fire onConnected only on the first ACK (UAS side 2xx dialog confirmation).
-    // Retransmitted ACKs must be silently absorbed.
-    if (!wasConfirmed && d->state==DialogState::Confirmed) {
-        RtpSession* rtp=rtpOf(d->id);
-        if (cbs_.onConnected) cbs_.onConnected(d->id,rtp);
+    // RFC 3261 §13.3.1.4: receiving the ACK is what confirms a UAS dialog.
+    // dlg_.update() processes the ACK as a plain request and never sets
+    // Confirmed (only 2xx responses do that in DialogLayer::update).
+    // Set Confirmed explicitly here so the state machine is correct and
+    // subsequent BYEs / re-INVITEs are accepted.
+    if (!wasConfirmed) {
+        d->state = DialogState::Confirmed;
+        RtpSession* rtp = rtpOf(d->id);
+        if (cbs_.onConnected) cbs_.onConnected(d->id, rtp);
     }
+    // Retransmitted ACKs (wasConfirmed==true) are silently absorbed.
 }
 
 void SipStack::handleBye(TxnId txnId, const SipMessage& msg) {
@@ -510,12 +555,103 @@ void SipStack::handleMessage(TxnId txnId, const SipMessage& msg) {
 
 void SipStack::handleOptions(TxnId txnId, const SipMessage& msg) {
     SipMessage ok=msg.makeResponse(200,"OK");
-    ok.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE",37);
+    ok.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE",42);
     txn_.sendResponse(txnId,ok);
 }
 
 void SipStack::handleUpdate(TxnId txnId, const SipMessage& msg) {
     SipMessage ok=msg.makeResponse(200,"OK"); txn_.sendResponse(txnId,ok);
+}
+
+// ── handleInfo (SIP-INFO DTMF, RFC 2976 + RFC 6086) ──────────────────────────
+// Supports the two widely-used body formats:
+//
+//   application/dtmf-relay  (Cisco/RFC 2833 legacy)
+//     Signal=5
+//     Duration=160
+//
+//   application/dtmf        (compact, RFC 4733 companion)
+//     body is just the digit character, e.g. "5"
+//
+void SipStack::handleInfo(TxnId txnId, const SipMessage& msg) {
+    // Always respond 200 OK immediately — the dialog stays alive regardless
+    // of whether we can decode the body.
+    SipMessage ok = msg.makeResponse(200, "OK");
+    txn_.sendResponse(txnId, ok);
+
+    if (!cbs_.onDtmf) return;
+
+    // Resolve the dialog so we can pass the call handle to the callback.
+    Dialog* d = dlg_.find(msg);
+    CallHandle handle = d ? d->id : InvalidDialog;
+
+    const char* ct   = msg.contentType.c_str();
+    const char* body = msg.body;
+    size_t      blen = msg.bodyLen;
+    if (!body || !blen) return;
+
+    uint8_t  digit = 0xFF;
+    uint16_t durMs = 0;
+
+    // ── application/dtmf-relay ────────────────────────────────────────────────
+    // Format (case-insensitive keys, values may have leading spaces):
+    //   Signal=<digit>\r\n
+    //   Duration=<ms>\r\n
+    if (strncasecmp(ct, "application/dtmf-relay", 22) == 0 ||
+        strncasecmp(ct, "application/dtmf",       16) == 0) {
+
+        // application/dtmf — single character body
+        if (strncasecmp(ct, "application/dtmf", 16) == 0 &&
+            strncasecmp(ct, "application/dtmf-relay", 21) != 0) {
+            // body is a single printable digit character
+            char ch = body[0];
+            if      (ch >= '0' && ch <= '9') digit = (uint8_t)(ch - '0');
+            else if (ch == '*')              digit = 10;
+            else if (ch == '#')              digit = 11;
+            else if (ch >= 'A' && ch <= 'D') digit = (uint8_t)(ch - 'A' + 12);
+            else if (ch >= 'a' && ch <= 'd') digit = (uint8_t)(ch - 'a' + 12);
+        } else {
+            // application/dtmf-relay: parse key=value lines
+            const char* p   = body;
+            const char* end = body + blen;
+            while (p < end) {
+                // Find end of line
+                const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+                size_t lineLen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+                // Strip trailing \r
+                const char* lineEnd = p + lineLen;
+                if (lineEnd > p && *(lineEnd - 1) == '\r') --lineEnd;
+
+                // Locate '='
+                const char* eq = (const char*)memchr(p, '=', (size_t)(lineEnd - p));
+                if (eq) {
+                    size_t keyLen = (size_t)(eq - p);
+                    const char* val = eq + 1;
+                    // Skip leading spaces in value
+                    while (val < lineEnd && *val == ' ') ++val;
+
+                    if (keyLen == 6 && strncasecmp(p, "Signal", 6) == 0) {
+                        char ch = *val;
+                        if      (ch >= '0' && ch <= '9') digit = (uint8_t)(ch - '0');
+                        else if (ch == '*')               digit = 10;
+                        else if (ch == '#')               digit = 11;
+                        else if (ch >= 'A' && ch <= 'D')  digit = (uint8_t)(ch - 'A' + 12);
+                        else if (ch >= 'a' && ch <= 'd')  digit = (uint8_t)(ch - 'a' + 12);
+                    } else if (keyLen == 8 && strncasecmp(p, "Duration", 8) == 0) {
+                        char tmp[16] = {};
+                        size_t vl = (size_t)(lineEnd - val);
+                        if (vl < sizeof(tmp)) { memcpy(tmp, val, vl); }
+                        durMs = (uint16_t)atoi(tmp);
+                    }
+                }
+                p = nl ? nl + 1 : end;
+            }
+        }
+    }
+
+    if (digit != 0xFF) {
+        cbs_.onDtmf(handle, digit, durMs);
+    }
 }
 
 // ── REGISTER response ─────────────────────────────────────────────────────────
@@ -571,8 +707,13 @@ void SipStack::handleInviteResp(Dialog* d, const SipMessage& msg) {
                         if (rtp) {
                             const char* ra=r->connAddr.empty()?d->remoteUri.c_str():r->connAddr.c_str();
                             RtpSession::Config rc; rc.pt=codec->payloadType(); rc.ssrc=rnd32();
+                            DialogId did = d->id;
+                            RtpCallbacks rtpCbs;
+                            rtpCbs.onDtmf = [this, did](uint8_t digit, uint16_t durMs) {
+                                if (cbs_.onDtmf) cbs_.onDtmf(did, digit, durMs);
+                            };
                             rtp->open(cfg_.localAddr.c_str(),rtpPort,ra,am->port,
-                                      codec,rc,{nullptr,nullptr,nullptr});
+                                      codec,rc,rtpCbs);
                         }
                     }
                 }
@@ -650,7 +791,7 @@ void SipStack::retryInviteWithAuth(Dialog* d, const SipMessage& resp) {
              cfg_.localUser.c_str(), cfg_.localAddr.c_str(), cfg_.localPort);
     req.contact.uri.assign(contact, strlen(contact));
     req.hasContact = true;
-    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,MESSAGE", 37);
+    req.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS,INFO,MESSAGE", 42);
     req.userAgent.assign("sip_stack/1.0", 13);
 
     // Build Authorization / Proxy-Authorization header

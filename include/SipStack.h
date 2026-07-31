@@ -103,6 +103,21 @@ struct StackCallbacks {
     std::function<void(bool ok, int code)>             onOptions;
     /** Raw unmatched request callback. */
     std::function<void(const SipMessage&, TxnId)>      onRequest;
+    /**
+     * @brief DTMF digit received callback.
+     *
+     * Fired for both in-band RFC 4733/2833 telephone-event RTP packets and
+     * out-of-band SIP INFO requests carrying application/dtmf-relay or
+     * application/dtmf bodies.
+     *
+     * @param handle  Dialog/call the DTMF arrived on.
+     * @param digit   Digit value 0-9=digits, 10=*, 11=#, 12-15=A-D.
+     * @param durMs   Event duration in milliseconds (0 when not reported by
+     *                the INFO method).
+     */
+    std::function<void(CallHandle handle,
+                       uint8_t digit,
+                       uint16_t durMs)>                onDtmf;
 };
 
 /**
@@ -270,6 +285,7 @@ private:
     void handleMessage (TxnId, const SipMessage&);
     void handleOptions (TxnId, const SipMessage&);
     void handleUpdate  (TxnId, const SipMessage&);
+    void handleInfo    (TxnId, const SipMessage&);
 
     // Response handlers (UAC)
     void handleInviteResp     (Dialog*, const SipMessage&);

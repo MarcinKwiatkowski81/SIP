@@ -90,10 +90,15 @@ bool TransactionLayer::onMessage(const SipMessage& msg, const char* srcHost, uin
             Transaction* inv=findByKey(br,Method::INVITE,TxnRole::Server);
             if(inv){ feedIST(*inv,msg); return true; }
         }
-        // ACK for non-2xx goes to INVITE server transaction
+        // ACK for non-2xx goes to the INVITE server transaction (IST_Completed).
+        // ACK for 2xx: the IST was already terminated by sendResponse(), so
+        // findByKey returns nullptr.  Return false so the TU (handleAck) sees it.
+        // Do NOT fall through to the generic "new server transaction" path below,
+        // which would create a spurious NIST for ACK and send a bogus 405 reply.
         if(msg.method==Method::ACK) {
             Transaction* inv=findByKey(br,Method::INVITE,TxnRole::Server);
             if(inv){ feedIST(*inv,msg); return true; }
+            return false;   // 2xx-ACK: pass to TU
         }
         Transaction* t=findByKey(br,msg.method,TxnRole::Server);
         if(t){ if(t->respLen) transmitResp(*t); return true; }
@@ -104,6 +109,11 @@ bool TransactionLayer::onMessage(const SipMessage& msg, const char* srcHost, uin
         t->method=msg.method; t->cseq=msg.cseq.seq; t->branch=br; t->callId=msg.callId;
         t->remoteHost.assign(srcHost,strlen(srcHost)); t->remotePort=srcPort; t->isUdp=true;
         t->state=(t->type==TxnType::Invite)?TxnState::IST_Proceeding:TxnState::NIST_Trying;
+        // Store the incoming request so the TU can build Via-correct responses
+        // via SipMessage::makeResponse() (e.g. accept() parsing ist->reqBuf).
+        // Client transactions store their outgoing request for retransmission;
+        // server transactions store the incoming request for response building.
+        t->reqLen = msg.format(t->reqBuf, sizeof t->reqBuf);
         if(cbs_.onRequest) cbs_.onRequest(t->id,msg);
         return true;
     } else {

@@ -53,6 +53,15 @@ static int         g_maxSecs = 30;
 
 static void sigHandler(int) { g_quit = true; }
 
+/** Convert a DTMF digit code (0–15) to its printable character. */
+static char dtmfChar(uint8_t digit) {
+    if (digit <= 9)  return (char)('0' + digit);
+    if (digit == 10) return '*';
+    if (digit == 11) return '#';
+    if (digit <= 15) return (char)('A' + digit - 12);  // A–D
+    return '?';
+}
+
 static int64_t msNow() {
     struct timeval tv; gettimeofday(&tv, nullptr);
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
@@ -111,12 +120,14 @@ static void* drainThread(void* /*arg*/) {
 int main(int argc, char** argv) {
     const char* asteriskIP   = nullptr;
     const char* localIP      = nullptr;
-    const char* sipPassword  = "secret100";
+    const char* sipUser      = "2005";
+    const char* sipPassword  = "haslo_2005";
+    int         extension    = 2001;
     uint16_t    asteriskPort = 5060;
     uint16_t    localPort    = 5062;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:l:w:o:p:P:s:t:h")) != -1) {
+    while ((opt = getopt(argc, argv, "a:l:w:o:p:P:s:u:t:e:h")) != -1) {
         switch (opt) {
         case 'a': asteriskIP   = optarg;             break;
         case 'l': localIP      = optarg;             break;
@@ -125,12 +136,14 @@ int main(int argc, char** argv) {
         case 'p': asteriskPort = (uint16_t)atoi(optarg); break;
         case 'P': localPort    = (uint16_t)atoi(optarg); break;
         case 's': sipPassword  = optarg;             break;
+        case 'u': sipUser      = optarg;             break;
         case 't': g_maxSecs    = atoi(optarg);       break;
+        case 'e': extension    = atoi(optarg);       break;
         default:
             printf("Usage: %s -a <asterisk-ip> -l <local-ip> "
                    "[-w test.wav] [-o recorded.wav] "
                    "[-p ast-port] [-P local-port] "
-                   "[-s password] [-t max-secs]\n", argv[0]);
+                   "[-s password] [-u user] [-e extension] [-t max-secs]\n", argv[0]);
             return 1;
         }
     }
@@ -149,14 +162,14 @@ int main(int argc, char** argv) {
 
     // ── Stack config ──────────────────────────────────────────────────────────
     StackConfig cfg;
-    cfg.localUser.assign("100", 3);
+    cfg.localUser.assign(sipUser, strlen(sipUser));
     cfg.localDomain.assign(asteriskIP, strlen(asteriskIP));
     cfg.localAddr.assign(localIP,      strlen(localIP));
     cfg.rtpLocalAddr  = cfg.localAddr;
     cfg.localPort     = localPort;
     cfg.registrarHost.assign(asteriskIP, strlen(asteriskIP));
     cfg.registrarPort = asteriskPort;
-    cfg.authUser.assign("100", 3);
+    cfg.authUser.assign(sipUser, strlen(sipUser));
     cfg.authPass.assign(sipPassword, strlen(sipPassword));
     cfg.regExpires    = 120;
     cfg.rtpBasePort   = 16400;
@@ -168,9 +181,9 @@ int main(int argc, char** argv) {
     StackCallbacks cbs;
 
     // ── REGISTER result ───────────────────────────────────────────────────────
-    cbs.onRegistered = [](bool ok, int code) {
+    cbs.onRegistered = [sipUser](bool ok, int code) {
         if (ok) {
-            printf("[SIP] Registered as 100  ok\n");
+            printf("[SIP] Registered as %s  ok\n", sipUser);
             g_registered = true;
         } else {
             fprintf(stderr, "[SIP] Registration FAILED  code=%d\n", code);
@@ -191,12 +204,26 @@ int main(int argc, char** argv) {
 
         if (rtp) {
             rtp->setCallbacks({
+                // onAudio: push decoded PCM straight into the WAV writer
                 [](const AudioFrame& f) { g_writer.push(f.pcm, f.samples); },
-                nullptr,   // onDtmf
+                // onDtmf: RFC 4733 / RFC 2833 in-band telephone-event
+                [h](uint8_t digit, uint16_t durMs) {
+                    printf("[DTMF] call=%u  digit=%c  duration=%u ms  (RFC 4733 RTP)\n",
+                           (unsigned)h, dtmfChar(digit), (unsigned)durMs);
+                },
                 nullptr    // onRawRtp
             });
             printf("[REC] recording wired to RTP onAudio callback\n");
         }
+    };
+
+    // ── DTMF received (SIP-INFO out-of-band) ─────────────────────────────────
+    // RFC 4733/2833 in-band DTMF is handled above inside rtp->setCallbacks().
+    // This callback catches SIP INFO requests carrying application/dtmf-relay
+    // or application/dtmf bodies, parsed by SipStack::handleInfo().
+    cbs.onDtmf = [](CallHandle h, uint8_t digit, uint16_t durMs) {
+        printf("[DTMF] call=%u  digit=%c  duration=%u ms  (SIP INFO)\n",
+               (unsigned)h, dtmfChar(digit), (unsigned)durMs);
     };
 
     // ── Call ended ────────────────────────────────────────────────────────────
@@ -236,7 +263,7 @@ int main(int argc, char** argv) {
     pthread_create(&tickTid, nullptr, +tickFn, &stack);
 
     // ── Step 1: REGISTER ─────────────────────────────────────────────────────
-    printf("[SIP] Registering as 100 @ %s:%u ...\n", asteriskIP, asteriskPort);
+    printf("[SIP] Registering as %s @ %s:%u ...\n", sipUser, asteriskIP, asteriskPort);
     stack.doRegister();
 
     int64_t deadline = msNow() + 5000;
@@ -253,7 +280,7 @@ int main(int argc, char** argv) {
     {
         // ── Step 2: INVITE ────────────────────────────────────────────────────
         char target[64];
-        snprintf(target, sizeof target, "sip:101@%s", asteriskIP);
+        snprintf(target, sizeof target, "sip:%d@%s", extension, asteriskIP);
         printf("[SIP] Calling %s ...\n", target);
 
         CallHandle h = stack.call(target);

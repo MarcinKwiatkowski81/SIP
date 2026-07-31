@@ -172,6 +172,10 @@ private:
     double   jitter_   = 0.0;
     uint32_t rxLastTs_ = 0;
     int64_t  rxLastWall_= 0;
+    // RFC 4733 end-bit deduplication: all 3 retransmitted end packets share
+    // the same RTP timestamp — fire onDtmf only for the first one seen.
+    uint32_t dtmfLastTs_    = 0;
+    bool     dtmfFired_     = false;
 
     Stats    stats_    = {};
 
