@@ -71,6 +71,7 @@ Result<Via> Via::parse(const char* s,size_t len){
     else    v.host.assign(hp,(size_t)(p-hp));
     while(p<end){
         if(*p==';'){++p;
+            while(p<end&&(*p==' '||*p=='\t'))++p;   // skip optional LWS after ';'
             const char* pk=p; while(p<end&&*p!=';'&&*p!=',')++p;
             size_t kl=(size_t)(p-pk);
             if     (strncasecmp(pk,"branch=",  7)==0) v.branch.assign(pk+7,kl-7);
@@ -107,7 +108,9 @@ Result<NameAddr> NameAddr::parse(const char* s,size_t len){
         const char* rb=(const char*)memchr(lb,'>',(size_t)(end-lb)); if(!rb) return Err::Parse;
         na.uri.assign(lb,(size_t)(rb-lb)); p=rb+1;
         while(p<end){
-            if(*p==';'){++p; const char* pk=p; while(p<end&&*p!=';'&&*p!=',')++p;
+            if(*p==';'){++p;
+                while(p<end&&(*p==' '||*p=='\t'))++p;   // skip optional LWS after ';'
+                const char* pk=p; while(p<end&&*p!=';'&&*p!=',')++p;
                 if(strncasecmp(pk,"tag=",4)==0) na.tag.assign(pk+4,(size_t)(p-pk-4));
                 else { na.params.append(";",1); na.params.append(pk,(size_t)(p-pk)); }
             } else ++p;
@@ -116,7 +119,9 @@ Result<NameAddr> NameAddr::parse(const char* s,size_t len){
         const char* sc=(const char*)memchr(p,';',(size_t)(end-p));
         if(sc){ na.uri.assign(p,(size_t)(sc-p)); p=sc;
             while(p<end){
-                if(*p==';'){++p; const char* pk=p; while(p<end&&*p!=';'&&*p!=',')++p;
+                if(*p==';'){++p;
+                    while(p<end&&(*p==' '||*p=='\t'))++p;   // skip optional LWS after ';'
+                    const char* pk=p; while(p<end&&*p!=';'&&*p!=',')++p;
                     if(strncasecmp(pk,"tag=",4)==0) na.tag.assign(pk+4,(size_t)(p-pk-4));
                 } else ++p;
             }

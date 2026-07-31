@@ -133,7 +133,10 @@ public:
         return true;
     }
 
-    void close() { if (fp_) { fclose(fp_); fp_=nullptr; } dataLeft_=0; done_=false; }
+    void close() {
+        if (fp_) { fclose(fp_); fp_=nullptr; }
+        dataLeft_=0; done_=false; srcPhase_=0; acc_=0;
+    }
     bool done()  const { return done_; }
 
     // Fill 'out' with exactly FRAME (160) samples at 8 kHz mono.
@@ -142,22 +145,44 @@ public:
         memset(out, 0, FRAME * sizeof(int16_t));
         if (done_ || !fp_) { done_=true; return false; }
 
+        // ── Fast path: native 8 kHz mono ─────────────────────────────────────
+        // Read the whole 20 ms frame in a single fread instead of 160
+        // individual 2-byte reads.  Eliminates per-sample call overhead and
+        // gives the OS a chance to hand us a contiguous block in one go.
+        if (ratio_ == 1 && channels_ == 1) {
+            size_t avail  = dataLeft_ / 2;          // samples remaining
+            size_t toRead = avail < FRAME ? avail : FRAME;
+            size_t got    = fread(out, 2, toRead, fp_);
+            dataLeft_ -= (uint32_t)(got * 2);
+            if (got < FRAME) done_ = true;          // short read → EOF
+            return !done_;
+        }
+
+        // ── General path: multi-channel and/or higher sample rate ─────────────
+        // Box-filter anti-alias decimation: accumulate ratio_ source samples
+        // and emit their average.  This is a simple rectangular (FIR) low-pass
+        // with -3 dB at Fs_src/(2*ratio_) ≈ 4 kHz — ideal for narrowband
+        // telephony — and completely eliminates the aliasing that point-
+        // sampling (keep-every-Nth) would otherwise introduce.
         size_t produced = 0;
         while (produced < FRAME) {
-            // Read one source sample (all channels, then pick first)
             int16_t src[8] = {};
             size_t bytes = (size_t)channels_ * 2;
             if (dataLeft_ < bytes) { done_=true; break; }
-            if (fread(src, 2, channels_, fp_) != channels_) { done_=true; break; }
-            dataLeft_ -= bytes;
-            // Down-mix to mono (average channels)
+            if (fread(src, 2, channels_, fp_) != (size_t)channels_) { done_=true; break; }
+            dataLeft_ -= (uint32_t)bytes;
+
+            // Down-mix to mono (average all channels)
             int32_t mono = 0;
             for (uint16_t c=0; c<channels_; ++c) mono += src[c];
             mono /= channels_;
-            // Decimation: only emit one output sample per ratio_ input samples
+
+            // Accumulate into box filter; emit one output sample per ratio_ inputs
+            acc_ += mono;
             if (++srcPhase_ >= ratio_) {
                 srcPhase_ = 0;
-                out[produced++] = (int16_t)mono;
+                out[produced++] = (int16_t)(acc_ / (int32_t)ratio_);
+                acc_ = 0;
             }
         }
         return !done_;
@@ -180,7 +205,8 @@ private:
     uint16_t channels_ = 1;
     uint32_t dataLeft_ = 0;
     uint32_t ratio_    = 1;
-    uint32_t srcPhase_ = 0;
+    uint32_t srcPhase_ = 0;   // position within current decimation group
+    int32_t  acc_      = 0;   // box-filter accumulator for anti-alias decimation
     bool     done_     = false;
 };
 

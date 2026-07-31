@@ -43,16 +43,35 @@ Dialog* DialogLayer::createUAS(const SipMessage& req, const Tag& localTag) {
 bool Dialog::matches(const SipMessage& msg) const {
     if(state==DialogState::Terminated) return false;
     if(!(callId==msg.callId)) return false;
-    if(isUAC) {
-        // UAC: localTag == From-tag (we put it there), remoteTag == To-tag
-        bool fromOk=localTag.eq(msg.from.tag.c_str(),msg.from.tag.len);
-        bool toOk  =remoteTag.empty()||remoteTag.eq(msg.to.tag.c_str(),msg.to.tag.len);
-        return fromOk && toOk;
-    } else {
-        // UAS: localTag == To-tag, remoteTag == From-tag
-        bool toOk  =localTag.eq(msg.to.tag.c_str(),msg.to.tag.len);
-        bool fromOk=remoteTag.empty()||remoteTag.eq(msg.from.tag.c_str(),msg.from.tag.len);
+    // RFC 3261 §12.2.2: dialog matching is direction-dependent, not role-dependent.
+    //
+    //   Incoming REQUEST (BYE, re-INVITE, INFO …)
+    //     The sender always places our tag in To and their tag in From,
+    //     regardless of whether we are UAC or UAS for the original dialog.
+    //       localTag  == msg.to.tag
+    //       remoteTag == msg.from.tag
+    //
+    //   Response to one of our outgoing requests (200 OK to INVITE/BYE …)
+    //     We always placed our tag in From of the request; the response
+    //     echoes it back in From unchanged.
+    //       localTag  == msg.from.tag
+    //       remoteTag == msg.to.tag
+    //
+    // The old code used the UAC branch unconditionally for UAC dialogs, which
+    // meant it compared localTag against msg.from.tag even for incoming BYEs,
+    // where msg.from.tag is the *remote* party's tag.  That caused dlg_.find()
+    // to return nullptr for every incoming BYE on an outbound call, so
+    // handleBye() never fired onBye() and call_and_record hung until timeout.
+    if(msg.isRequest) {
+        // Incoming in-dialog request: we are always To.
+        bool toOk  = localTag.eq(msg.to.tag.c_str(),msg.to.tag.len);
+        bool fromOk= remoteTag.empty()||remoteTag.eq(msg.from.tag.c_str(),msg.from.tag.len);
         return toOk && fromOk;
+    } else {
+        // Response to our outgoing request: we are always From.
+        bool fromOk= localTag.eq(msg.from.tag.c_str(),msg.from.tag.len);
+        bool toOk  = remoteTag.empty()||remoteTag.eq(msg.to.tag.c_str(),msg.to.tag.len);
+        return fromOk && toOk;
     }
 }
 
