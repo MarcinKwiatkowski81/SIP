@@ -88,7 +88,32 @@ bool TransactionLayer::onMessage(const SipMessage& msg, const char* srcHost, uin
         const Branch& br=msg.via[0].branch;
         if(msg.method==Method::CANCEL) {
             Transaction* inv=findByKey(br,Method::INVITE,TxnRole::Server);
-            if(inv){ feedIST(*inv,msg); return true; }
+            if(inv && inv->state==TxnState::IST_Proceeding) {
+                // RFC 3261 §9.2: create a NIST for CANCEL and immediately
+                // respond 200 OK, then notify TU via the INVITE IST id so it
+                // can send 487 to the INVITE IST.
+                Transaction* ct=pool_.alloc();
+                if(ct) {
+                    ct->id=nextId_++; ct->role=TxnRole::Server;
+                    ct->type=TxnType::NonInvite; ct->method=Method::CANCEL;
+                    ct->cseq=msg.cseq.seq; ct->branch=br; ct->callId=msg.callId;
+                    ct->remoteHost.assign(srcHost,strlen(srcHost));
+                    ct->remotePort=srcPort; ct->isUdp=true;
+                    ct->reqLen=msg.format(ct->reqBuf,sizeof ct->reqBuf);
+                    // Auto-respond 200 OK to CANCEL
+                    auto req=SipMessage::parse(ct->reqBuf,ct->reqLen);
+                    if(req.ok()) {
+                        SipMessage ok=req->makeResponse(200,"OK");
+                        ct->respLen=ok.format(ct->respBuf,sizeof ct->respBuf);
+                        transmitResp(*ct);
+                    }
+                    ct->state=TxnState::NIST_Completed;
+                    ct->timerJ=ct->isUdp?ms()+64*SIP_T1:ms()+1;
+                }
+                // Notify TU with the INVITE IST id: it must send 487 there.
+                feedIST(*inv,msg);
+                return true;
+            }
         }
         // ACK for non-2xx goes to the INVITE server transaction (IST_Completed).
         // ACK for 2xx: the IST was already terminated by sendResponse(), so

@@ -99,10 +99,15 @@ bool PbxApp::start(const PbxConfig& cfg) {
 
     serverCfg.rtpBasePort = cfg_.rtpBasePort;
     if (!cfg_.rtpAdvertiseAddr.empty()) {
-        serverCfg.rtpLocalAddr.assign(cfg_.rtpAdvertiseAddr.c_str(), cfg_.rtpAdvertiseAddr.size());
-    } else {
+        // Explicit -r <ip> from command line — always use it.
+        serverCfg.rtpLocalAddr.assign(cfg_.rtpAdvertiseAddr.c_str(),
+                                      cfg_.rtpAdvertiseAddr.size());
+    } else if (cfg_.bindAddr != "0.0.0.0" && !cfg_.bindAddr.empty()) {
+        // Bound to a specific address — use it for RTP as well.
         serverCfg.rtpLocalAddr.assign(cfg_.bindAddr.c_str(), cfg_.bindAddr.size());
     }
+    // Otherwise leave rtpLocalAddr empty so SipServer::init() auto-detects
+    // the primary NIC address via getifaddrs() at startup.
 
     if (!cfg_.userDbPath.empty()) {
         serverCfg.userDbPath.assign(cfg_.userDbPath.c_str(), cfg_.userDbPath.size());

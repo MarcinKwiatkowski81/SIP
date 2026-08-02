@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <sys/time.h>
 #include <pthread.h>
 #include <cerrno>
@@ -100,19 +101,37 @@ void SipServer::genBranch(Branch& b) const {
     b.assign(tmp,strlen(tmp));
 }
 void SipServer::genCallId(CallId& id) const {
-    char tmp[80]; snprintf(tmp,sizeof tmp,"%08x%08x@%s",rnd32(),rnd32(),
-                           cfg_.localAddr.c_str());
+    // Use the routable IP so Call-IDs are globally unique and look well-formed.
+    const char* ip = cfg_.rtpLocalAddr.empty()
+                   ? cfg_.localAddr.c_str() : cfg_.rtpLocalAddr.c_str();
+    char tmp[80]; snprintf(tmp,sizeof tmp,"%08x%08x@%s",rnd32(),rnd32(),ip);
     id.assign(tmp,strlen(tmp));
 }
 void SipServer::genTag(Tag& t) const {
     char tmp[16]; snprintf(tmp,sizeof tmp,"%08x",rnd32()); t.assign(tmp,8);
 }
 bool SipServer::isLocal(const char* domain) const {
-    if (!domain) return false;
-    if (cfg_.domain==domain) return true;
-    if (cfg_.localAddr==domain) return true;
-    // Also match "localhost", "127.0.0.1" if running locally
-    return (strcmp(domain,"localhost")==0 || strcmp(domain,"127.0.0.1")==0);
+    if (!domain || !*domain) return false;
+    if (cfg_.domain   == domain) return true;
+    if (cfg_.localAddr== domain) return true;
+    if (strcmp(domain,"localhost")==0 || strcmp(domain,"127.0.0.1")==0) return true;
+
+    // When the server is bound to 0.0.0.0 (all interfaces), phones reach us by
+    // our actual NIC IP (e.g. 192.168.32.2) rather than the SIP domain name
+    // (e.g. pbx.local).  Walk every local interface address so any such IP is
+    // recognised as ours — without hard-coding it in the config.
+    struct ifaddrs* ifa_list = nullptr;
+    if (getifaddrs(&ifa_list) != 0) return false;
+    bool found = false;
+    for (struct ifaddrs* ifa = ifa_list; ifa && !found; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        char buf[INET_ADDRSTRLEN] = {};
+        const auto* sa4 = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &sa4->sin_addr, buf, sizeof buf))
+            found = (strcmp(buf, domain) == 0);
+    }
+    freeifaddrs(ifa_list);
+    return found;
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
@@ -176,6 +195,31 @@ bool SipServer::init(ServerConfig cfg, ServerCallbacks cbs) {
           [this](TxnId id,const SipMessage& m){ onTxnRequest(id,m); },
           [this](TxnId id){ onTxnTerminated(id); } }
     );
+
+    // ── Auto-detect RTP advertise address ────────────────────────────────────
+    // When the server is bound to 0.0.0.0 (all interfaces) and no explicit
+    // -r <rtp-ip> was given, phones would receive SDP with c=IN IP4 0.0.0.0
+    // which is unroutable.  Walk local interfaces to find the first non-loopback
+    // IPv4 address and use it as the relay address advertised in SDP.
+    if (cfg_.rtpLocalAddr.empty() &&
+        (cfg_.localAddr.empty() || cfg_.localAddr == "0.0.0.0")) {
+        struct ifaddrs* ifa_list = nullptr;
+        if (getifaddrs(&ifa_list) == 0) {
+            for (struct ifaddrs* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                const auto* sa4 =
+                    reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+                if (sa4->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+                char buf[INET_ADDRSTRLEN] = {};
+                if (inet_ntop(AF_INET, &sa4->sin_addr, buf, sizeof buf)) {
+                    cfg_.rtpLocalAddr.assign(buf, strlen(buf));
+                    printf("[SERVER] RTP relay address auto-detected: %s\n", buf);
+                    break;
+                }
+            }
+            freeifaddrs(ifa_list);
+        }
+    }
 
     running_ = true;
     printf("[SERVER] SIP server started  %s:%u  domain=%s  mode=%s\n",
@@ -280,35 +324,75 @@ void SipServer::handleRegister(TxnId txnId, const SipMessage& msg,
         auto parsed  = auth::parseChallenge(authStr, strlen(authStr));
         if (!parsed.ok()) { sendResponse(txnId,400,"Bad Request"); return; }
 
-        // Extract response/nc/cnonce/qop from Authorization header
-        const char* respVal = strstr(authStr,"response=\"");
-        char responseHex[64]={};
-        if (respVal) { respVal+=10; const char* e=strchr(respVal,'"'); if(e) { size_t l=e-respVal; if(l<64){strncpy(responseHex,respVal,l);} } }
+        // Extract all credential fields from the Authorization header
+        auto extractQuoted = [&](const char* key, char* out, size_t outSz) {
+            const char* p = strstr(authStr, key);
+            if (!p) return;
+            p += strlen(key);
+            const char* e = strchr(p, '"');
+            if (!e) return;
+            size_t l = (size_t)(e - p);
+            if (l >= outSz) l = outSz - 1;
+            strncpy(out, p, l); out[l] = '\0';
+        };
+        auto extractUnquoted = [&](const char* key, char* out, size_t outSz) {
+            const char* p = strstr(authStr, key);
+            if (!p) return;
+            p += strlen(key);
+            // value ends at comma, whitespace, or end of string
+            size_t l = 0;
+            while (p[l] && p[l] != ',' && p[l] != ' ' && p[l] != '\r' && p[l] != '\n') ++l;
+            if (l >= outSz) l = outSz - 1;
+            strncpy(out, p, l); out[l] = '\0';
+        };
 
-        const char* userVal = strstr(authStr,"username=\"");
-        char username[64]={};
-        if (userVal) { userVal+=10; const char* e=strchr(userVal,'"'); if(e) { size_t l=e-userVal; if(l<64){strncpy(username,userVal,l);} } }
+        char username[64]  = {};
+        char uri[256]      = {};
+        char responseHex[64]= {};
+        char cnonceVal[64] = {};
+        char ncVal[16]     = {};
+        char qopVal[16]    = {};
 
-        const char* uriVal = strstr(authStr,"uri=\"");
-        char uri[256]={};
-        if (uriVal) { uriVal+=5; const char* e=strchr(uriVal,'"'); if(e) { size_t l=e-uriVal; if(l<256){strncpy(uri,uriVal,l);} } }
+        extractQuoted  ("username=\"",  username,    sizeof username);
+        extractQuoted  ("uri=\"",       uri,         sizeof uri);
+        extractQuoted  ("response=\"",  responseHex, sizeof responseHex);
+        extractQuoted  ("cnonce=\"",    cnonceVal,   sizeof cnonceVal);
+        extractUnquoted("nc=",          ncVal,        sizeof ncVal);
+        extractQuoted  ("qop=",         qopVal,       sizeof qopVal);
+        // qop may appear unquoted: qop=auth
+        if (!qopVal[0]) extractUnquoted("qop=", qopVal, sizeof qopVal);
+
+        uint32_t nc = (uint32_t)strtoul(ncVal, nullptr, 16);
+        if (!nc) nc = 1; // default if missing
 
         if (!validateNonce(parsed->nonce.c_str(), now)) {
             char ch[512]; buildChallenge(ch,sizeof ch,false);
             SipMessage r=msg.makeResponse(401,"Unauthorized");
             r.wwwAuth.assign(ch,strlen(ch));
-            /* Stale=true would need dedicated field - skipped */
             txn_.sendResponse(txnId,r); return;
         }
 
-        if (!users_.verifyDigest(username,*parsed,Method::REGISTER,uri,
-                                  responseHex,1,nullptr,nullptr)) {
+        if (!users_.verifyDigest(username, *parsed, Method::REGISTER, uri,
+                                  responseHex, nc,
+                                  cnonceVal[0] ? cnonceVal : nullptr,
+                                  qopVal[0]    ? qopVal    : nullptr)) {
             sendResponse(txnId,403,"Forbidden"); return;
         }
     }
 
-    // Get AOR from To header
-    char aor[256]; snprintf(aor,sizeof aor,"%s",msg.to.uri.c_str());
+    // Get AOR from To header — normalise the host to cfg_.domain so that
+    // registrations via IP (e.g. sip:101@192.168.32.2) and registrations via
+    // hostname (e.g. sip:101@pbx.local) share one canonical AOR in the DB,
+    // and INVITE lookups that also use cfg_.domain find them correctly.
+    char aor[256];
+    {
+        auto toSipUri = SipUri::parse(msg.to.uri.c_str());
+        if (toSipUri.ok() && !toSipUri->user.empty())
+            snprintf(aor, sizeof aor, "sip:%s@%s",
+                     toSipUri->user.c_str(), cfg_.domain.c_str());
+        else
+            snprintf(aor, sizeof aor, "%s", msg.to.uri.c_str());
+    }
 
     // Determine expires
     uint32_t expires = msg.expires;
@@ -590,20 +674,26 @@ void SipServer::b2buaInvite(TxnId legATxn, const SipMessage& invite,
     SipMessage fwd; fwd.isRequest=true; fwd.method=Method::INVITE;
     fwd.requestUri.assign(invite.requestUri.c_str(),invite.requestUri.len);
 
-    char furi[256]; snprintf(furi,sizeof furi,"sip:%s@%s",
-        cfg_.domain.empty()?"server":cfg_.domain.c_str(), cfg_.localAddr.c_str());
+    // Use the routable IP in all SIP headers (Via, From, Contact, Call-ID).
+    // cfg_.rtpLocalAddr is always set to a reachable NIC IP after init().
+    const char* la = cfg_.rtpLocalAddr.empty()
+                   ? cfg_.localAddr.c_str() : cfg_.rtpLocalAddr.c_str();
+
+    char furi[256]; snprintf(furi,sizeof furi,"sip:pbx@%s",la);
     fwd.from.uri.assign(furi,strlen(furi));
     genTag(call->legBLocalTag); fwd.from.tag=call->legBLocalTag;
-    fwd.to.uri.assign(invite.requestUri.c_str(),invite.requestUri.len);
+    // Request-URI = callee's registered contact (not the original request-URI)
+    fwd.requestUri.assign(target.contact.c_str(),target.contact.len);
+    // To = callee's AOR (from original invite)
+    fwd.to.uri.assign(invite.to.uri.c_str(),invite.to.uri.len);
     genCallId(call->legBCallId); fwd.callId=call->legBCallId;
     fwd.cseq={call->legBCSeq++, Method::INVITE};
     fwd.maxForwards=70;
     Branch br; genBranch(br);
-    fwd.via[0].host=cfg_.localAddr; fwd.via[0].port=cfg_.port;
+    fwd.via[0].host.assign(la,strlen(la)); fwd.via[0].port=cfg_.port;
     fwd.via[0].branch=br; fwd.via[0].transport.assign("UDP",3);
     fwd.viaCount=1;
-    char contact[256]; snprintf(contact,sizeof contact,"sip:%s@%s:%u",
-        cfg_.domain.c_str(), cfg_.localAddr.c_str(), cfg_.port);
+    char contact[256]; snprintf(contact,sizeof contact,"<sip:pbx@%s:%u>",la,cfg_.port);
     fwd.contact.uri.assign(contact,strlen(contact)); fwd.hasContact=true;
     fwd.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS",30);
     fwd.userAgent.assign("sip_server/1.0",14);
@@ -637,17 +727,33 @@ void SipServer::b2buaInvite(TxnId legATxn, const SipMessage& invite,
     }
 }
 
+// Build a correctly-formed response for leg A by re-parsing the original
+// INVITE that the caller sent us.  This guarantees Via / From / To /
+// Call-ID match exactly what the caller expects — no guesswork.
+static SipMessage makeLegAResponse(TransactionLayer& txn, TxnId legATxn,
+                                   int code, const char* reason) {
+    const Transaction* t = txn.findById(legATxn);
+    if (t) {
+        auto req = SipMessage::parse(t->reqBuf, t->reqLen);
+        if (req.ok()) return req->makeResponse(code, reason);
+    }
+    // Fallback (should never happen): bare minimum without Via
+    SipMessage r;
+    r.isRequest = false; r.statusCode = code;
+    r.reason.assign(reason, strlen(reason));
+    return r;
+}
+
 void SipServer::b2buaLegBResponse(B2buaCall& call, const SipMessage& resp) {
     if (resp.isProvisional()) {
         if (resp.statusCode == 180 || resp.statusCode == 183) {
             call.state = CallState::Ringing;
-            // Forward ringing to leg A
-            SipMessage ring = resp.makeResponse(resp.statusCode, resp.reason.c_str());
-            ring.isRequest = false;
-            ring.from.uri  = call.callerUri; ring.from.tag=call.legARemoteTag;
-            ring.to.tag    = call.legALocalTag;
-            ring.callId    = call.legACallId;
-            ring.cseq.seq  = 1; ring.cseq.method = Method::INVITE;
+            // Forward ringing upstream with proper Via from the stored INVITE.
+            SipMessage ring = makeLegAResponse(txn_, call.legATxn,
+                                               resp.statusCode, resp.reason.c_str());
+            // Use the server's own leg-A tag (not the callee's tag) so that
+            // the caller's early-dialog To-tag stays consistent with the 200 OK.
+            ring.to.tag = call.legALocalTag;
             txn_.sendResponse(call.legATxn, ring);
         }
         return;
@@ -657,6 +763,10 @@ void SipServer::b2buaLegBResponse(B2buaCall& call, const SipMessage& resp) {
         call.state     = CallState::Connected;
         call.connectMs = nowMs();
         call.legBRemoteTag = resp.to.tag;
+
+        // Save callee's Contact for ACK routing and subsequent BYE.
+        if (resp.hasContact && !resp.contact.uri.empty())
+            call.calleeTarget = resp.contact.uri;
 
         // Parse callee SDP answer to get their RTP address
         if (resp.body && resp.bodyLen) {
@@ -681,18 +791,22 @@ void SipServer::b2buaLegBResponse(B2buaCall& call, const SipMessage& resp) {
         // Open RTP relay
         openRtpRelay(call);
 
-        // Build 200 OK for leg A — rewrite SDP with our relay addr:rtpAPort
+        // Build 200 OK for leg A by re-parsing the stored INVITE so the
+        // response carries the exact Via / From / To / Call-ID the caller
+        // expects — identical to what 180 Ringing used above.
         const char* relayAddr = cfg_.rtpLocalAddr.empty()
                               ? cfg_.localAddr.c_str() : cfg_.rtpLocalAddr.c_str();
-        SipMessage ok; ok.isRequest=false; ok.statusCode=200; ok.reason.assign("OK",2);
-        ok.from.uri=call.callerUri; ok.from.tag=call.legARemoteTag;
-        ok.to.tag=call.legALocalTag;
-        ok.callId=call.legACallId; ok.cseq={1,Method::INVITE};
-        char contact[256]; snprintf(contact,sizeof contact,"sip:%s@%s:%u",
-            cfg_.domain.c_str(), cfg_.localAddr.c_str(), cfg_.port);
-        ok.contact.uri.assign(contact,strlen(contact)); ok.hasContact=true;
+        SipMessage ok = makeLegAResponse(txn_, call.legATxn, 200, "OK");
+        // Overwrite the To-tag with our stable leg-A local tag.
+        ok.to.tag = call.legALocalTag;
+        // Provide our routable Contact so the caller can send ACK / BYE to us.
+        const char* la2 = cfg_.rtpLocalAddr.empty()
+                        ? cfg_.localAddr.c_str() : cfg_.rtpLocalAddr.c_str();
+        char contact2[256];
+        snprintf(contact2,sizeof contact2,"<sip:pbx@%s:%u>",la2,cfg_.port);
+        ok.contact.uri.assign(contact2,strlen(contact2)); ok.hasContact=true;
         ok.allow.assign("INVITE,ACK,BYE,CANCEL,OPTIONS",30);
-        // Forward or rewrite SDP
+        // Attach callee SDP rewritten with our relay address and caller-side port.
         if (resp.body && resp.bodyLen) {
             size_t sdpLen = rewriteSdp(resp.body, resp.bodyLen,
                                        relayAddr, call.rtpAPort,
@@ -709,11 +823,9 @@ void SipServer::b2buaLegBResponse(B2buaCall& call, const SipMessage& resp) {
         return;
     }
 
-    // Final non-2xx: reject leg A
-    SipMessage r; r.isRequest=false; r.statusCode=resp.statusCode; r.reason=resp.reason;
-    r.from.uri=call.callerUri; r.from.tag=call.legARemoteTag;
-    r.to.tag=call.legALocalTag;
-    r.callId=call.legACallId; r.cseq={1,Method::INVITE};
+    // Final non-2xx: reject leg A with a properly-formed response.
+    SipMessage r = makeLegAResponse(txn_, call.legATxn,
+                                    resp.statusCode, resp.reason.c_str());
     txn_.sendResponse(call.legATxn, r);
 
     CdrRecord cdr;
@@ -732,20 +844,34 @@ void SipServer::handleAck(const SipMessage& msg) {
     B2buaCall* call = findB2buaByCallId(msg.callId);
     if (!call) return;
     // Forward ACK to leg B
+    // Destination: use Contact from callee's 200 OK (calleeTarget), else AOR.
+    const char* dstUriStr = call->calleeTarget.empty()
+                          ? call->calleeUri.c_str()
+                          : call->calleeTarget.c_str();
+    // Strip angle-brackets if present (<sip:...>).
+    char stripped[256]; strncpy(stripped, dstUriStr, sizeof stripped-1); stripped[sizeof stripped-1]=0;
+    char* uriStart = stripped;
+    if (stripped[0]=='<') {
+        uriStart = stripped+1;
+        char* gt=strchr(uriStart,'>'); if(gt)*gt=0;
+    }
+    auto dstParsed = SipUri::parse(uriStart);
+    if (!dstParsed.ok()) return;
+
+    const char* la = cfg_.rtpLocalAddr.empty()
+                   ? cfg_.localAddr.c_str() : cfg_.rtpLocalAddr.c_str();
     SipMessage fwd = msg;
     Branch br; genBranch(br);
-    fwd.via[0].host=cfg_.localAddr; fwd.via[0].port=cfg_.port;
+    fwd.via[0].host.assign(la,strlen(la)); fwd.via[0].port=cfg_.port;
     fwd.via[0].branch=br; fwd.via[0].transport.assign("UDP",3);
     fwd.from.tag=call->legBLocalTag;
     fwd.callId=call->legBCallId;
     fwd.cseq.method=Method::ACK;
+    // Request-URI of ACK = callee's Contact URI
+    fwd.requestUri.assign(uriStart,strlen(uriStart));
     // Send directly (ACK for 2xx is outside transaction layer)
-    auto uri = SipUri::parse(call->calleeTarget.empty()
-                           ? call->calleeUri.c_str()
-                           : call->calleeTarget.c_str());
-    if (!uri.ok()) return;
     char buf[SIP_MAX_MSG]; size_t n=fwd.format(buf,sizeof buf);
-    if (n) sendRaw(buf,n,uri->host.c_str(),uri->effectivePort(),Proto::Udp);
+    if (n) sendRaw(buf,n,dstParsed->host.c_str(),dstParsed->effectivePort(),Proto::Udp);
 }
 
 void SipServer::handleBye(TxnId txnId, const SipMessage& msg) {
@@ -793,32 +919,50 @@ void SipServer::handleBye(TxnId txnId, const SipMessage& msg) {
 }
 
 void SipServer::handleCancel(TxnId txnId, const SipMessage& msg) {
-    sendResponse(txnId, 200, "OK");
+    // NOTE: the transaction layer already sent 200 OK to the CANCEL NIST and
+    // calls us with txnId = the INVITE IST id.  Do NOT call sendResponse()
+    // here for the CANCEL — that was the old bug that sent 200 OK for the
+    // *INVITE* and destroyed the IST before we could send 487.
+    //
+    // txnId here IS the INVITE IST.  Send 487 to it so the caller's ICT
+    // transitions from Completed to Confirmed and eventually terminates.
 
     if (cfg_.b2buaMode) {
         B2buaCall* call = findB2buaByCallId(msg.callId);
-        if (call && call->state==CallState::Calling) {
-            if (call->legBTxn!=InvalidTxn) txn_.cancelInvite(call->legBTxn);
-            SipMessage r; r.isRequest=false; r.statusCode=487; r.reason.assign("Request Terminated",18);
-            r.from.uri=call->callerUri; r.to.tag=call->legALocalTag;
-            r.callId=call->legACallId; r.cseq={1,Method::INVITE};
-            txn_.sendResponse(call->legATxn,r);
+        // Accept CANCEL during Calling (no provisional yet) and Ringing states.
+        if (call && (call->state == CallState::Calling ||
+                     call->state == CallState::Ringing)) {
+            if (call->legBTxn != InvalidTxn) txn_.cancelInvite(call->legBTxn);
+            // 487 to leg A — built from the stored INVITE so Via headers are correct.
+            SipMessage r = makeLegAResponse(txn_, txnId,
+                                            487, "Request Terminated");
+            r.to.tag = call->legALocalTag;  // must be stable across responses
+            txn_.sendResponse(txnId, r);
 
             CdrRecord cdr;
-            cdr.callId=call->callId; cdr.fromUri=call->callerUri; cdr.toUri=call->calleeUri;
-            cdr.startMs=call->startMs; cdr.endMs=nowMs();
-            cdr.sipCode=487; cdr.result=CdrResult::Cancelled;
-            cdr_.write(cdr); freeB2bua(*call);
+            cdr.callId  = call->callId;  cdr.fromUri = call->callerUri;
+            cdr.toUri   = call->calleeUri;
+            cdr.startMs = call->startMs; cdr.endMs   = nowMs();
+            cdr.sipCode = 487;           cdr.result  = CdrResult::Cancelled;
+            cdr_.write(cdr);
+            if (cbs_.onCallEnd) cbs_.onCallEnd(cdr);
+            freeB2bua(*call);
         }
     } else {
         ProxyCall* call = findProxyByCallId(msg.callId);
         if (call && call->legBTxn!=InvalidTxn) {
             txn_.cancelInvite(call->legBTxn);
+            // Send 487 to the INVITE IST so the caller gets a proper rejection.
+            SipMessage r = makeLegAResponse(txn_, txnId,
+                                            487, "Request Terminated");
+            txn_.sendResponse(txnId, r);
             CdrRecord cdr;
             cdr.callId=call->callId; cdr.fromUri=call->callerUri; cdr.toUri=call->calleeUri;
             cdr.startMs=call->startMs; cdr.endMs=nowMs();
             cdr.sipCode=487; cdr.result=CdrResult::Cancelled;
-            cdr_.write(cdr); freeProxy(*call);
+            cdr_.write(cdr);
+            if (cbs_.onCallEnd) cbs_.onCallEnd(cdr);
+            freeProxy(*call);
         }
     }
 }
@@ -936,27 +1080,38 @@ bool SipServer::openRtpRelay(B2buaCall& call) {
     call.rtpAFd=fa; call.rtpBFd=fb;
 
     // Two relay threads: A→B and B→A
-    struct RelayArgs* argAB = new RelayArgs{this,&call,fa,fb,{},call.calleeRtpPort,
-                                            call.callerPayloadType, call.calleePayloadType,
-                                            resolveCodec(codecs_, call.callerPayloadType,
-                                                         call.callerCodecName.c_str()),
-                                            resolveCodec(codecs_, call.calleePayloadType,
-                                                         call.calleeCodecName.c_str())};
-    strncpy(argAB->dstAddr,call.calleeRtpAddr,47);
-    argAB->dstPort=call.calleeRtpPort;
-    struct RelayArgs* argBA = new RelayArgs{this,&call,fb,fa,{},call.callerRtpPort,
-                                            call.calleePayloadType, call.callerPayloadType,
-                                            resolveCodec(codecs_, call.calleePayloadType,
-                                                         call.calleeCodecName.c_str()),
-                                            resolveCodec(codecs_, call.callerPayloadType,
-                                                         call.callerCodecName.c_str())};
-    strncpy(argBA->dstAddr,call.callerRtpAddr,47);
-    argBA->dstPort=call.callerRtpPort;
-    pthread_t tA,tB;
-    pthread_create(&tA,nullptr,rtpRelayThread,argAB);
-    pthread_create(&tB,nullptr,rtpRelayThread,argBA);
-    pthread_detach(tA); pthread_detach(tB);
-    call.relayRunning=true;
+    // Build per-thread argument blocks.  Ownership transfers to the threads;
+    // pointers are also saved in B2buaCall so closeRtpRelay can signal them.
+    auto* argAB = new RtpRelayArgs{};
+    argAB->srcFd   = fa;    argAB->dstFd = fb;
+    argAB->dstPort = call.calleeRtpPort;
+    argAB->srcPt   = call.callerPayloadType;
+    argAB->dstPt   = call.calleePayloadType;
+    argAB->srcCodec= resolveCodec(codecs_, call.callerPayloadType, call.callerCodecName.c_str());
+    argAB->dstCodec= resolveCodec(codecs_, call.calleePayloadType, call.calleeCodecName.c_str());
+    argAB->running = true;
+    strncpy(argAB->dstAddr, call.calleeRtpAddr, sizeof(argAB->dstAddr)-1);
+
+    auto* argBA = new RtpRelayArgs{};
+    argBA->srcFd   = fb;    argBA->dstFd = fa;
+    argBA->dstPort = call.callerRtpPort;
+    argBA->srcPt   = call.calleePayloadType;
+    argBA->dstPt   = call.callerPayloadType;
+    argBA->srcCodec= resolveCodec(codecs_, call.calleePayloadType, call.calleeCodecName.c_str());
+    argBA->dstCodec= resolveCodec(codecs_, call.callerPayloadType, call.callerCodecName.c_str());
+    argBA->running = true;
+    strncpy(argBA->dstAddr, call.callerRtpAddr, sizeof(argBA->dstAddr)-1);
+
+    // Save pointers so closeRtpRelay can set running=false cleanly.
+    call.relayArgAB = argAB;
+    call.relayArgBA = argBA;
+
+    pthread_t tA, tB;
+    pthread_create(&tA, nullptr, rtpRelayThread, argAB);
+    pthread_create(&tB, nullptr, rtpRelayThread, argBA);
+    pthread_detach(tA);
+    pthread_detach(tB);
+    call.relayRunning = true;
     printf("[B2BUA] RTP relay open: %s:%u <-> server:%u/%u <-> %s:%u\n",
            call.callerRtpAddr, call.callerRtpPort,
            call.rtpAPort, call.rtpBPort,
@@ -972,36 +1127,57 @@ bool SipServer::openRtpRelay(B2buaCall& call) {
 }
 
 void SipServer::closeRtpRelay(B2buaCall& call) {
+    // Signal relay threads to stop via their own stop-flag.  This is safe
+    // even if the B2buaCall slot is immediately reused for a new call,
+    // because the flag lives in the heap-allocated RtpRelayArgs block, not
+    // in the B2buaCall slot.
+    if (call.relayArgAB) { call.relayArgAB->running = false; call.relayArgAB = nullptr; }
+    if (call.relayArgBA) { call.relayArgBA->running = false; call.relayArgBA = nullptr; }
+    // Closing the sockets will unblock any pending recv() immediately.
     if (call.rtpAFd>=0){::shutdown(call.rtpAFd,SHUT_RDWR);close(call.rtpAFd);call.rtpAFd=-1;}
     if (call.rtpBFd>=0){::shutdown(call.rtpBFd,SHUT_RDWR);close(call.rtpBFd);call.rtpBFd=-1;}
     call.relayRunning=false;
 }
 
 void* SipServer::rtpRelayThread(void* arg) {
-    auto* a=(RelayArgs*)arg;
-    struct timeval tv{0,100000}; // 100ms recv timeout
-    setsockopt(a->srcFd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-    struct sockaddr_in dst{}; dst.sin_family=AF_INET;
-    dst.sin_port=htons(a->dstPort);
-    dst.sin_addr.s_addr=inet_addr(a->dstAddr);
+    auto* a = (RtpRelayArgs*)arg;
+    // Short receive timeout so the loop condition is checked regularly.
+    struct timeval tv{0, 50000}; // 50 ms
+    setsockopt(a->srcFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in dst{};
+    dst.sin_family      = AF_INET;
+    dst.sin_port        = htons(a->dstPort);
+    dst.sin_addr.s_addr = inet_addr(a->dstAddr);
     uint8_t buf[2048];
     uint8_t out[4096];
-    while (a->call->relayRunning && a->call->used) {
-        ssize_t n=recv(a->srcFd,buf,sizeof buf,0);
-        if (n<=0) continue;
+
+    for (;;) {
+        if (!a->running) break;          // stop-flag set by closeRtpRelay
+
+        ssize_t n = recv(a->srcFd, buf, sizeof buf, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;                // normal receive timeout — re-check flag
+            break;                       // EBADF or other fatal error: socket closed
+        }
+        if (n == 0) break;               // orderly shutdown
+
         size_t outLen = (size_t)n;
         const bool canMapPt = (a->srcPt != 0 || a->dstPt != 0);
         bool sent = false;
         if (canMapPt && transcodeRtpPacket(buf, (size_t)n,
-                                           out, sizeof(out), &outLen,
-                                           a->dstPt, a->srcCodec, a->dstCodec)) {
-            sent = sendto(a->dstFd, out, outLen, 0, (sockaddr*)&dst, sizeof dst) > 0;
+                                           out, sizeof out, &outLen,
+                                           a->dstPt,
+                                           static_cast<ICodec*>(a->srcCodec),
+                                           static_cast<ICodec*>(a->dstCodec))) {
+            sent = sendto(a->dstFd, out, outLen, 0,
+                          (sockaddr*)&dst, sizeof dst) > 0;
         }
-        if (!sent) {
-            sendto(a->dstFd,buf,(size_t)n,0,(sockaddr*)&dst,sizeof dst);
-        }
+        if (!sent)
+            sendto(a->dstFd, buf, (size_t)n, 0, (sockaddr*)&dst, sizeof dst);
     }
-    delete a; return nullptr;
+    delete a;
+    return nullptr;
 }
 
 // ── Pool management ───────────────────────────────────────────────────────────
@@ -1020,7 +1196,16 @@ ProxyCall* SipServer::findProxyByCallId(const CallId& id) {
 }
 
 B2buaCall* SipServer::allocB2bua() {
-    for(auto& c:b2buaCalls_) if(!c.used){c.used=true;return &c;} return nullptr;
+    for(auto& c:b2buaCalls_) if(!c.used){
+        // Zero-initialise the slot so stale tags / IDs / FDs from a previous
+        // call cannot leak into the new one.
+        memset(&c,0,sizeof c);
+        c.rtpAFd=-1; c.rtpBFd=-1;
+        c.legBTxn=InvalidTxn;
+        c.used=true;
+        return &c;
+    }
+    return nullptr;
 }
 void SipServer::freeB2bua(B2buaCall& c) { closeRtpRelay(c); c.used=false; }
 B2buaCall* SipServer::findB2buaByLegA(TxnId id) {

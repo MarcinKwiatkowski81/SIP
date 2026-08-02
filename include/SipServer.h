@@ -112,6 +112,26 @@ struct ServerCallbacks {
 };
 
 /**
+ * @brief Per-relay-thread argument block, heap-allocated and owned by the thread.
+ *
+ * `running` is the authoritative stop-flag.  `closeRtpRelay` sets it to false
+ * and immediately closes the socket so any blocked `recv()` wakes up.  The
+ * thread calls `delete this` on exit — callers must not touch the block after
+ * setting `running = false`.
+ */
+struct RtpRelayArgs {
+    int            srcFd   = -1;
+    int            dstFd   = -1;
+    char           dstAddr[48] = {};
+    uint16_t       dstPort = 0;
+    uint8_t        srcPt   = 0;
+    uint8_t        dstPt   = 0;
+    void*          srcCodec = nullptr;   // ICodec*
+    void*          dstCodec = nullptr;   // ICodec*
+    volatile bool  running  = true;      ///< set false to request thread exit
+};
+
+/**
  * @brief High-level call state for proxy and B2BUA call records.
  */
 enum class CallState : uint8_t {
@@ -203,10 +223,12 @@ struct B2buaCall {
     uint8_t   calleePayloadType = 0;
     /** Callee negotiated codec name. */
     Str<24>   calleeCodecName;
-    /** Relay thread handle (legacy/single-thread field). */
-    pthread_t relayTid;
     /** True while RTP relay loops should run. */
-    bool      relayRunning = false;
+    bool           relayRunning = false;
+    /** Relay arg blocks; owned by threads but pointer saved here so
+     *  closeRtpRelay can signal them to stop cleanly. */
+    RtpRelayArgs*  relayArgAB   = nullptr;   // caller-side → callee-side thread
+    RtpRelayArgs*  relayArgBA   = nullptr;   // callee-side → caller-side thread
     // CSeq counters
     /** Outbound leg-B CSeq counter. */
     uint32_t  legBCSeq = 1;
@@ -349,18 +371,7 @@ private:
     bool      openRtpRelay(B2buaCall& call);
     void      closeRtpRelay(B2buaCall& call);
     static void* rtpRelayThread(void* arg);
-    struct RelayArgs {
-        SipServer* srv;
-        B2buaCall* call;
-        int srcFd;
-        int dstFd;
-        char dstAddr[48];
-        uint16_t dstPort;
-        uint8_t srcPt;
-        uint8_t dstPt;
-        ICodec* srcCodec;
-        ICodec* dstCodec;
-    };
+    // RtpRelayArgs is defined at namespace scope (see above B2buaCall).
 
     // ── Auth helpers ─────────────────────────────────────────────────────────
     void  buildChallenge(char* buf, size_t sz, bool proxy);
